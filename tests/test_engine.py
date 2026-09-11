@@ -6,12 +6,11 @@ import sys
 import pytest
 
 from termops.engine import OpsEngine
-from termops.models import ApprovalDecision, TaskStatus
+from termops.models import AnalysisRequest, ApprovalDecision, TargetRef, TaskKind, TaskStatus
+from termops.store import StateStore
 
 
-async def wait_for_status(
-    engine: OpsEngine, task_id: str, expected: set[TaskStatus], timeout: float = 3
-) -> TaskStatus:
+async def wait_for_status(engine: OpsEngine, task_id: str, expected: set[TaskStatus], timeout: float = 3) -> TaskStatus:
     deadline = asyncio.get_running_loop().time() + timeout
     while asyncio.get_running_loop().time() < deadline:
         status = engine.store.get_task(task_id).status
@@ -61,6 +60,27 @@ async def test_analysis_finds_module_not_found(settings) -> None:
     codes = {f.code for f in findings}
     assert "MODULE_NOT_FOUND" in codes
     assert engine.store.verify_event_chain()
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_correction_fires_end_to_end_without_crashing(settings) -> None:
+    """A stored correction (uppercase severity) must classify, not crash the task."""
+    engine = OpsEngine(settings)
+    sample = 'ERROR: relation "audit_log" does not exist'
+    engine.record_correction(
+        sample_text=sample,
+        code="POSTGRES_UNDEFINED_TABLE",
+        severity="HIGH",
+        meaning="Migration not applied.",
+    )
+    task = engine.submit_analysis(sample, source="stderr", language="")
+    status = await wait_for_status(
+        engine, task.id, {TaskStatus.SUCCEEDED, TaskStatus.WAITING_APPROVAL, TaskStatus.FAILED}
+    )
+    assert status != TaskStatus.FAILED
+    finding = next(f for f in engine.store.list_findings(task.id) if f.code == "POSTGRES_UNDEFINED_TABLE")
+    assert finding.severity.value == "high"
     await engine.stop()
 
 
@@ -186,4 +206,44 @@ async def test_event_chain_integrity(settings) -> None:
     )
     await wait_for_status(engine, task.id, {TaskStatus.SUCCEEDED, TaskStatus.WAITING_APPROVAL})
     assert engine.store.verify_event_chain()
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_restart_replays_queued_task(settings) -> None:
+    store = StateStore(settings.database_path)
+    request = AnalysisRequest(
+        text="ModuleNotFoundError: No module named 'click'",
+        source="stderr",
+        language="python",
+    )
+    task = store.create_task(
+        TaskKind.ANALYZE,
+        TargetRef(kind="workspace", name="stderr"),
+        request.model_dump(mode="json"),
+    )
+    assert task.status == TaskStatus.QUEUED
+
+    engine = OpsEngine(settings, store=store)
+    await engine.start()
+    await wait_for_status(engine, task.id, {TaskStatus.SUCCEEDED, TaskStatus.WAITING_APPROVAL})
+    await engine.stop()
+
+
+@pytest.mark.asyncio
+async def test_restart_fails_inflight_task_without_approved_action(settings) -> None:
+    store = StateStore(settings.database_path)
+    request = AnalysisRequest(text="connection refused", source="stderr")
+    task = store.create_task(
+        TaskKind.ANALYZE,
+        TargetRef(kind="workspace", name="stderr"),
+        request.model_dump(mode="json"),
+    )
+    # Simulate a crash mid-execution with no approved action to resume from.
+    store.update_task(task.id, TaskStatus.EXECUTING, force=True)
+
+    engine = OpsEngine(settings, store=store)
+    await engine.start()
+    await wait_for_status(engine, task.id, {TaskStatus.FAILED})
+    assert engine.store.get_task(task.id).status == TaskStatus.FAILED
     await engine.stop()

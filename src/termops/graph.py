@@ -15,7 +15,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 
-from .diagnostics import classify_error, suggest_followup_command
+from .diagnostics import classify_command_risk, suggest_followup_command
 from .models import (
     ActionStatus,
     ActionStep,
@@ -54,31 +54,7 @@ async def _monitor_node(state: OpsGraphState, config: RunnableConfig) -> dict[st
     engine = _engine(config)
     task_id = state["task_id"]
     await engine._db(engine._mark_phase, task_id, MapePhase.MONITOR, "capturing input context")
-
-    task = await engine._db(engine.store.get_task, task_id)
-    request_data = dict(task.input)
-    request_data.pop("run", None)
-    request = AnalysisRequest.model_validate(request_data)
-
-    run = task.input.get("run")
-    if run and task.kind.value == "analyze":
-        result = await engine._run_command(run["command"], run.get("cwd"), run.get("timeout", 120))
-        request.text = "\n".join(part for part in [result["stdout"], result["stderr"]] if part)
-        request.exit_code = result["returncode"]
-
-    env = engine.probe.snapshot(cwd=request.cwd, language=request.language)
-    await engine._db(
-        engine.store.add_observation,
-        task_id,
-        "analysis_input",
-        request.source,
-        "ok",
-        "Captured the submitted error context.",
-        {
-            **request.model_dump(mode="json"),
-            "env": env.model_dump(mode="json"),
-        },
-    )
+    request, env = await engine._monitor(task_id)
     return {"request": request.model_dump(mode="json"), "env": env.model_dump(mode="json")}
 
 
@@ -88,7 +64,8 @@ async def _analyze_node(state: OpsGraphState, config: RunnableConfig) -> dict[st
     await engine._db(engine._mark_phase, task_id, MapePhase.ANALYZE, "pattern matching and finding extraction")
 
     request = AnalysisRequest.model_validate(state["request"])
-    classification = classify_error(request.text, request.exit_code)
+    # Operator corrections (feedback loop) take precedence over built-in rules.
+    classification = await engine._db(engine.classify, request.text, request.exit_code)
 
     observations = await engine._db(engine.store.list_observations, task_id)
     evidence_ids = [observations[0].id] if observations else []
@@ -97,7 +74,7 @@ async def _analyze_node(state: OpsGraphState, config: RunnableConfig) -> dict[st
             engine.store.add_finding,
             task_id,
             match["code"],
-            Severity(match["severity"]),
+            Severity(str(match["severity"]).lower()),
             0.9,
             match["meaning"],
             f"Line {match['line']}: {match['text']}",
@@ -128,7 +105,21 @@ async def _retrieve_node(state: OpsGraphState, config: RunnableConfig) -> dict[s
         if first_line:
             chunks = await engine._db(engine.store.search_knowledge, first_line, 3)
 
-    return {"retrieved_knowledge": chunks}
+    # Operator-pinned history tasks take precedence over FTS similarity hits.
+    history_chunks: list[dict[str, Any]] = []
+    for hid in request.history_task_ids[:5]:
+        try:
+            history_chunks.extend(await engine._db(engine.store.list_knowledge, hid))
+        except KeyError:
+            continue
+    seen: set[str] = set()
+    merged: list[dict[str, Any]] = []
+    for chunk in [*history_chunks, *chunks]:
+        cid = chunk.get("id")
+        if cid and cid not in seen:
+            seen.add(cid)
+            merged.append(chunk)
+    return {"retrieved_knowledge": merged[:5]}
 
 
 async def _llm_attribution_node(state: OpsGraphState, config: RunnableConfig) -> dict[str, Any]:
@@ -183,18 +174,22 @@ async def _plan_node(state: OpsGraphState, config: RunnableConfig) -> dict[str, 
     if not suggested:
         return {"proposed_command": None}
 
+    risk = {"low": RiskLevel.LOW, "medium": RiskLevel.MEDIUM, "high": RiskLevel.HIGH}[
+        classify_command_risk(suggested)
+    ]
     action = await engine._db(
         engine.store.create_action,
         task_id,
         "run_command",
         suggested,
-        RiskLevel.MEDIUM,
+        risk,
         {
             "command": suggested,
             "requested_command": request.command,
             "cwd": request.cwd,
             "language": request.language,
             "source": request.source,
+            "safety_notes": (llm_attr.get("safety_notes") if llm_attr else []) or [],
         },
         [
             ActionStep(order=1, action="run_command", description="Run the proposed command locally"),
@@ -217,9 +212,7 @@ async def _wait_approval_node(state: OpsGraphState, config: RunnableConfig) -> d
     engine = _engine(config)
     task_id = state["task_id"]
     await engine._db(engine._mark_phase, task_id, MapePhase.PLAN, "waiting for operator approval")
-    report = await engine._db(
-        engine._build_report, task_id, "A command proposal is ready for approval."
-    )
+    report = await engine._db(engine._build_report, task_id, "A command proposal is ready for approval.")
     await engine._db(
         engine.store.update_task,
         task_id,
@@ -240,9 +233,7 @@ async def _finish_node(state: OpsGraphState, config: RunnableConfig) -> dict[str
         state.get("classification", {}),
         request,
         llm_attribution=LLMAttribution.model_validate(llm_attr) if llm_attr else None,
-        retrieved_knowledge_ids=[
-            chunk["id"] for chunk in (state.get("retrieved_knowledge") or [])
-        ],
+        retrieved_knowledge_ids=[chunk["id"] for chunk in (state.get("retrieved_knowledge") or [])],
     )
     return {"terminal_status": "succeeded"}
 
@@ -282,12 +273,14 @@ async def _observe_node(state: OpsGraphState, config: RunnableConfig) -> dict[st
         f"Approved command exited with code {result['returncode']}.",
         result,
     )
-    for match in classify_error(result["stdout"] + "\n" + result["stderr"], result["returncode"])["findings"]:
+    result_text = result["stdout"] + "\n" + result["stderr"]
+    result_classification = await engine._db(engine.classify, result_text, result["returncode"])
+    for match in result_classification["findings"]:
         await engine._db(
             engine.store.add_finding,
             task_id,
             match["code"],
-            Severity(match["severity"]),
+            Severity(str(match["severity"]).lower()),
             0.85,
             match["meaning"],
             f"Line {match['line']}: {match['text']}",
@@ -310,9 +303,7 @@ async def _knowledge_node(state: OpsGraphState, config: RunnableConfig) -> dict[
     assert result is not None, "command_result must be set before knowledge node"
 
     await engine._db(engine._mark_phase, task_id, MapePhase.OBSERVE, "verifying command result")
-    await engine._db(
-        engine.store.update_task, task_id, TaskStatus.VERIFYING, phase=MapePhase.OBSERVE
-    )
+    await engine._db(engine.store.update_task, task_id, TaskStatus.VERIFYING, phase=MapePhase.OBSERVE)
 
     await engine._db(engine._mark_phase, task_id, MapePhase.KNOWLEDGE, "recording command execution outcome")
     summary = f"Approved command completed with exit code {result['returncode']}."

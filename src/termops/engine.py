@@ -8,9 +8,11 @@ Only actions that have passed human approval are executed.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shlex
 import subprocess
+import time
 from collections.abc import Callable, Coroutine
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -23,6 +25,7 @@ from .config import Settings
 from .diagnostics import classify_error
 from .graph import build_analysis_graph, build_execution_graph
 from .llm_client import LLMClient
+from .metrics import registry as metrics_registry
 from .models import (
     TERMINAL_TASK_STATUSES,
     ActionStatus,
@@ -49,6 +52,8 @@ from .store import StateStore
 MAX_CONCURRENT_TASKS = 8
 DB_WORKERS = 8
 
+log = logging.getLogger("termops.engine")
+
 
 class OpsEngine:
     """Local error analysis engine with approval-gated action execution."""
@@ -66,11 +71,11 @@ class OpsEngine:
         self._jobs: set[asyncio.Task[Any]] = set()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
-        self._db_executor = ThreadPoolExecutor(
-            max_workers=DB_WORKERS, thread_name_prefix="termops-db"
-        )
+        self._db_executor = ThreadPoolExecutor(max_workers=DB_WORKERS, thread_name_prefix="termops-db")
         self._analysis_graph: Any | None = None
         self._execution_graph: Any | None = None
+        self._corrections_cache: dict[str, dict[str, Any]] | None = None
+        self._corrections_loaded_at = 0.0
         self.llm = LLMClient(settings.llm)
         self.operator_token = self._load_or_create_operator_token()
 
@@ -117,14 +122,17 @@ class OpsEngine:
             await asyncio.gather(*self._jobs, return_exceptions=True)
         self._db_executor.shutdown(wait=True, cancel_futures=True)
 
+    def bind_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Bind the owning event loop so off-thread submissions can schedule onto it."""
+        current = self._loop
+        if current is None or current.is_closed():
+            self._loop = loop
+
     def _spawn(self, coroutine: Coroutine[Any, Any, Any]) -> None:
         """Schedule a tracked task on the owning event loop, from any thread."""
         loop = self._loop
         if loop is None or loop.is_closed():
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
+            loop = asyncio.get_running_loop()
         if not loop.is_running():
             raise RuntimeError("cannot spawn task: no running event loop")
         loop.call_soon_threadsafe(self._track_task, self._gated(coroutine))
@@ -132,7 +140,12 @@ class OpsEngine:
     def _track_task(self, coroutine: Coroutine[Any, Any, Any]) -> None:
         job = asyncio.get_running_loop().create_task(coroutine)
         self._jobs.add(job)
-        job.add_done_callback(self._jobs.discard)
+        metrics_registry.set_gauge("termops_queue_depth", float(len(self._jobs)))
+        job.add_done_callback(self._on_job_done)
+
+    def _on_job_done(self, job: asyncio.Task[Any]) -> None:
+        self._jobs.discard(job)
+        metrics_registry.set_gauge("termops_queue_depth", float(len(self._jobs)))
 
     async def _gated(self, coroutine: Coroutine[Any, Any, Any]) -> None:
         async with self._task_semaphore:
@@ -168,14 +181,63 @@ class OpsEngine:
             "profile": self.settings.profile,
             "host": self.probe.capabilities(),
             "llm": {
-            "provider": self.llm.config.provider.value,
-            "enabled": self.llm.enabled,
-            "model": self.llm.config.model if self.llm.enabled else None,
-            "reason": "llm attribution active" if self.llm.enabled else "deterministic production core",
-        },
+                "provider": self.llm.config.provider.value,
+                "enabled": self.llm.enabled,
+                "model": self.llm.config.model if self.llm.enabled else None,
+                "reason": "llm attribution active" if self.llm.enabled else "deterministic production core",
+            },
             "orchestration": {"mape_k": True, "framework": "langgraph"},
             "event_chain_valid": self.store.verify_event_chain(),
         }
+
+    # ------------------------------------------------------------------
+    # Operator corrections (feedback loop)
+    # ------------------------------------------------------------------
+
+    _CORRECTIONS_TTL = 30.0
+
+    def get_corrections(self) -> dict[str, dict[str, Any]]:
+        """Return the corrections map, refreshing from the store at most every TTL."""
+        now = time.monotonic()
+        if self._corrections_cache is None or (now - self._corrections_loaded_at) > self._CORRECTIONS_TTL:
+            self._corrections_cache = self.store.get_corrections()
+            self._corrections_loaded_at = now
+        return self._corrections_cache
+
+    def invalidate_corrections(self) -> None:
+        self._corrections_cache = None
+
+    def record_correction(
+        self,
+        sample_text: str,
+        code: str,
+        severity: str,
+        meaning: str,
+        remediation: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist an operator correction and make it effective immediately."""
+        from .diagnostics import normalize_error_text
+
+        fingerprint = normalize_error_text(sample_text)
+        result = self.store.upsert_correction(
+            fingerprint=fingerprint,
+            sample=sample_text,
+            code=code,
+            severity=severity,
+            meaning=meaning,
+            remediation=remediation,
+            created_by=self.settings.operator_name,
+        )
+        self.invalidate_corrections()
+        return result
+
+    def classify(self, text: str, exit_code: int | None = None) -> dict[str, Any]:
+        """Classify error text with operator corrections applied."""
+        result = classify_error(text, exit_code, corrections=self.get_corrections())
+        for finding in result.get("findings", []):
+            if finding.get("source") == "correction" and finding.get("fingerprint"):
+                self.store.increment_correction_hits(finding["fingerprint"])
+        return result
 
     # ------------------------------------------------------------------
     # Public submission API
@@ -274,9 +336,10 @@ class OpsEngine:
         task = await self._db(self.store.get_task, task_id)
         if task.status != TaskStatus.QUEUED:
             return
-        await self._db(
-            self.store.update_task, task_id, TaskStatus.RUNNING, phase=MapePhase.MONITOR
-        )
+        await self._db(self.store.update_task, task_id, TaskStatus.RUNNING, phase=MapePhase.MONITOR)
+        metrics_registry.inc("termops_tasks_started_total")
+        started = time.perf_counter()
+        log.info("task started", extra={"task_id": task_id, "kind": task.kind.value})
         try:
             if task.kind == TaskKind.ANALYZE:
                 await self._run_analysis_graph(task_id)
@@ -288,7 +351,17 @@ class OpsEngine:
                 await self._knowledge_task(task_id)
             else:
                 raise ValueError(f"unsupported task kind: {task.kind.value}")
+            metrics_registry.inc("termops_tasks_succeeded_total")
+            log.info(
+                "task succeeded",
+                extra={"task_id": task_id, "duration_s": round(time.perf_counter() - started, 3)},
+            )
         except Exception as exc:
+            metrics_registry.inc("termops_tasks_failed_total")
+            log.warning(
+                "task failed",
+                extra={"task_id": task_id, "error": str(exc)[:500]},
+            )
             current = await self._db(self.store.get_task, task_id)
             if current.status not in TERMINAL_TASK_STATUSES:
                 await self._db(
@@ -299,6 +372,8 @@ class OpsEngine:
                     phase=MapePhase.KNOWLEDGE,
                     force=True,
                 )
+        finally:
+            metrics_registry.observe("termops_analysis_duration_seconds", time.perf_counter() - started)
 
     async def _run_analysis_graph(self, task_id: str) -> None:
         config: RunnableConfig = RunnableConfig(configurable={"engine": self})
@@ -306,9 +381,7 @@ class OpsEngine:
 
     async def _run_execution_graph(self, task_id: str, action_id: str) -> None:
         config: RunnableConfig = RunnableConfig(configurable={"engine": self})
-        await self.execution_graph.ainvoke(
-            {"task_id": task_id, "action_id": action_id}, config=config
-        )
+        await self.execution_graph.ainvoke({"task_id": task_id, "action_id": action_id}, config=config)
 
     async def _verify_task(self, task_id: str) -> None:
         """Run a verification command and analyze its output."""
@@ -332,12 +405,14 @@ class OpsEngine:
         )
 
         await self._db(self._mark_phase, task_id, MapePhase.OBSERVE, "analyzing verification output")
-        for match in classify_error(result["stdout"] + "\n" + result["stderr"], result["returncode"])["findings"]:
+        verify_text = result["stdout"] + "\n" + result["stderr"]
+        verification = await self._db(self.classify, verify_text, result["returncode"])
+        for match in verification["findings"]:
             await self._db(
                 self.store.add_finding,
                 task_id,
                 match["code"],
-                Severity(match["severity"]),
+                Severity(str(match["severity"]).lower()),
                 0.85,
                 match["meaning"],
                 f"Line {match['line']}: {match['text']}",
@@ -475,18 +550,43 @@ class OpsEngine:
         if not args:
             raise ValueError("command is empty")
         resolved_cwd = cwd if cwd and Path(cwd).exists() else None
-        process = await asyncio.to_thread(
-            subprocess.run,
-            args,
-            capture_output=True,
-            text=True,
-            cwd=resolved_cwd,
-            shell=False,
-            timeout=timeout,
-            check=False,
-        )
+        command_line = subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args)
+        try:
+            process = await asyncio.to_thread(
+                subprocess.run,
+                args,
+                capture_output=True,
+                text=True,
+                cwd=resolved_cwd,
+                shell=False,
+                timeout=timeout,
+                check=False,
+            )
+        except FileNotFoundError:
+            # Missing binary (e.g. a suggested command not on this PATH) is a
+            # *result*, not a task-fatal error.
+            return {
+                "command": command_line,
+                "cwd": resolved_cwd,
+                "returncode": 127,
+                "stdout": "",
+                "stderr": f"command not found or not on PATH: {args[0]}",
+            }
+        except subprocess.TimeoutExpired as exc:
+            def _tail(value: object) -> str:
+                if isinstance(value, bytes):
+                    return value.decode(errors="replace")[-8000:]
+                return value[-8000:] if isinstance(value, str) else ""
+
+            return {
+                "command": command_line,
+                "cwd": resolved_cwd,
+                "returncode": 124,
+                "stdout": _tail(exc.output),
+                "stderr": (f"command timed out after {timeout}s\n" + _tail(exc.stderr))[-8000:],
+            }
         return {
-            "command": subprocess.list2cmdline(args) if os.name == "nt" else shlex.join(args),
+            "command": command_line,
             "cwd": resolved_cwd,
             "returncode": process.returncode,
             "stdout": process.stdout[-8000:],
@@ -530,9 +630,7 @@ class OpsEngine:
         except ValueError:
             expired = self.store.get_action(action_id)
             if expired.status == ActionStatus.EXPIRED:
-                self.store.update_task(
-                    expired.task_id, TaskStatus.FAILED, error="action approval expired", force=True
-                )
+                self.store.update_task(expired.task_id, TaskStatus.FAILED, error="action approval expired", force=True)
             raise
         if decision.decision == "reject":
             self.store.update_task(action.task_id, TaskStatus.CANCELLED)
@@ -548,7 +646,11 @@ class OpsEngine:
         if task.status == TaskStatus.RECONCILING and task.phase == MapePhase.EXECUTE:
             actions = await self._db(self.store.list_actions, task_id)
             pending_action = next(
-                (action for action in actions if action.status == ActionStatus.APPROVED),
+                (
+                    action
+                    for action in actions
+                    if action.status in {ActionStatus.APPROVED, ActionStatus.EXECUTING}
+                ),
                 None,
             )
             if pending_action:

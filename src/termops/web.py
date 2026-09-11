@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import json
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any, Protocol
@@ -17,6 +19,48 @@ from .security import new_token
 from .store import StateStore
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+class _LoginFailureLimiter:
+    """Per-IP login failure lockout.
+
+    Login codes are high-entropy one-time tokens, so brute force is already
+    impractical; this adds defense in depth by slowing repeated guessing and
+    making abuse visible in metrics/logs.
+    """
+
+    def __init__(self, max_failures: int = 5, lockout_seconds: float = 300.0) -> None:
+        self.max_failures = max_failures
+        self.lockout_seconds = lockout_seconds
+        # ip -> [failure_count, locked_until_monotonic]
+        self._failures: dict[str, list[float]] = {}
+
+    def locked(self, ip: str) -> bool:
+        entry = self._failures.get(ip)
+        if entry is None or entry[1] == 0.0:
+            # No record, or failures below the lockout threshold.
+            return False
+        if time.monotonic() < entry[1]:
+            return True
+        # Lockout expired — reset.
+        self._failures.pop(ip, None)
+        return False
+
+    def record_failure(self, ip: str) -> None:
+        if len(self._failures) > 4096:  # bound memory: evict stale/expired entries
+            now = time.monotonic()
+            self._failures = {k: v for k, v in self._failures.items() if v[1] > now}
+        entry = self._failures.get(ip)
+        if entry is None or (entry[1] > 0.0 and time.monotonic() >= entry[1]):
+            # First failure, or the previous lockout has expired.
+            entry = [0.0, 0.0]
+            self._failures[ip] = entry
+        entry[0] += 1
+        if entry[0] >= self.max_failures:
+            entry[1] = time.monotonic() + self.lockout_seconds
+
+    def record_success(self, ip: str) -> None:
+        self._failures.pop(ip, None)
 
 
 class DisconnectAware(Protocol):
@@ -47,6 +91,7 @@ def static_dir() -> Path:
 def build_web_router(settings: Settings, engine: OpsEngine) -> APIRouter:
     router = APIRouter()
     templates = Jinja2Templates(directory=BASE_DIR / "templates")
+    login_limiter = _LoginFailureLimiter()
 
     async def session_for(request: Request) -> dict[str, Any] | None:
         token = request.cookies.get("termops_session", "")
@@ -64,7 +109,7 @@ def build_web_router(settings: Settings, engine: OpsEngine) -> APIRouter:
     async def require_csrf(request: Request) -> dict[str, Any]:
         session = await require_session(request)
         supplied = request.headers.get("x-csrf-token", "")
-        if not supplied or supplied != session["csrf_token"]:
+        if not supplied or not hmac.compare_digest(supplied, str(session["csrf_token"])):
             raise HTTPException(status_code=403, detail="CSRF validation failed")
         return session
 
@@ -80,13 +125,23 @@ def build_web_router(settings: Settings, engine: OpsEngine) -> APIRouter:
 
     @router.get("/login", response_class=HTMLResponse)
     async def login(request: Request, code: str = "") -> Any:
+        client_ip = request.client.host if request.client else "unknown"
+        if login_limiter.locked(client_ip):
+            return templates.TemplateResponse(
+                request=request,
+                name="login.html",
+                context={"request": request, "error": "尝试次数过多，请稍后再试。"},
+                status_code=429,
+            )
         if not code or not await asyncio.to_thread(engine.store.consume_login_code, code):
+            login_limiter.record_failure(client_ip)
             return templates.TemplateResponse(
                 request=request,
                 name="login.html",
                 context={"request": request, "error": "登录链接无效或已过期。"},
                 status_code=401,
             )
+        login_limiter.record_success(client_ip)
         session_token = new_token()
         csrf_token = new_token()
         await asyncio.to_thread(
@@ -99,9 +154,18 @@ def build_web_router(settings: Settings, engine: OpsEngine) -> APIRouter:
             max_age=settings.session_ttl_seconds,
             httponly=True,
             samesite="strict",
-            secure=False,
+            secure=settings.web_secure_cookie,
             path="/",
         )
+        return response
+
+    @router.get("/logout")
+    async def logout(request: Request) -> RedirectResponse:
+        token = request.cookies.get("termops_session", "")
+        if token:
+            await asyncio.to_thread(engine.store.delete_web_session, token)
+        response = RedirectResponse("/login", status_code=303)
+        response.delete_cookie("termops_session", path="/")
         return response
 
     @router.get("/ui/", response_class=HTMLResponse)
@@ -181,9 +245,7 @@ def build_web_router(settings: Settings, engine: OpsEngine) -> APIRouter:
             return redirect
         stats = await asyncio.to_thread(engine.store.knowledge_stats)
         items = await asyncio.to_thread(engine.store.list_knowledge, limit=100)
-        search_results = (
-            await asyncio.to_thread(engine.store.search_knowledge, q, 10) if q.strip() else []
-        )
+        search_results = await asyncio.to_thread(engine.store.search_knowledge, q, 10) if q.strip() else []
         return templates.TemplateResponse(
             request=request,
             name="knowledge.html",
@@ -222,9 +284,7 @@ def build_web_router(settings: Settings, engine: OpsEngine) -> APIRouter:
         body = await request.json()
         decision = ApprovalDecision.model_validate(body)
         action = await asyncio.to_thread(engine.decide_action, action_id, decision)
-        return JSONResponse(
-            {"action": action.model_dump(mode="json"), "location": f"/ui/tasks/{action.task_id}"}
-        )
+        return JSONResponse({"action": action.model_dump(mode="json"), "location": f"/ui/tasks/{action.task_id}"})
 
     @router.get("/ui/tasks/{task_id}/stream")
     async def task_stream(request: Request, task_id: str, after: int = 0) -> StreamingResponse:

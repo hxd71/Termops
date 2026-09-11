@@ -18,6 +18,7 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: System :: Systems Administration",
     "Topic :: Software Development :: Debuggers",
 ]
@@ -32,6 +33,7 @@ dependencies = [
     "pydantic>=2.10.0",
     "pyyaml>=6.0.2",
     "tomli>=2.0.1; python_version < '3.11'",
+    "tomli-w>=1.0.0",
     "uvicorn>=0.34.0",
 ]
 
@@ -59,9 +61,6 @@ Issues = "https://github.com/hxd71/Termops/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/termops"]
-
-[tool.hatch.build.targets.wheel.force-include]
-"src/termops/hooks" = "termops/hooks"
 
 [tool.ruff]
 target-version = "py310"

@@ -37,6 +37,7 @@ class Settings:
     run_dir: Path = Path("~/.termops/run").expanduser()
     web_host: str = "127.0.0.1"
     web_port: int = 8923
+    web_secure_cookie: bool = False  # enable when serving the UI behind HTTPS
     approval_ttl_seconds: int = 900
     session_ttl_seconds: int = 8 * 60 * 60
     operator_name: str = "local-operator"
@@ -45,18 +46,22 @@ class Settings:
     llm: LLMConfig = field(default_factory=LLMConfig)
 
     # ── Terminal hook settings ──
-    hook_enabled: bool = False
     hook_shell: str = "auto"  # auto, powershell, bash, zsh
-    hook_capture_stderr: bool = True
-    hook_capture_stdout: bool = True
-    hook_max_output: int = 8000
-    hook_min_exit_code: int = 1  # only capture on exit codes >= this
 
     env_allowlist: set[str] = field(
         default_factory=lambda: {
-            "PATH", "HOME", "USER", "SHELL", "OS", "PYTHONPATH",
-            "VIRTUAL_ENV", "CONDA_DEFAULT_ENV", "NODE_PATH",
-            "GO111MODULE", "RUST_BACKTRACE", "LANG",
+            "PATH",
+            "HOME",
+            "USER",
+            "SHELL",
+            "OS",
+            "PYTHONPATH",
+            "VIRTUAL_ENV",
+            "CONDA_DEFAULT_ENV",
+            "NODE_PATH",
+            "GO111MODULE",
+            "RUST_BACKTRACE",
+            "LANG",
         }
     )
     extra: dict[str, Any] = field(default_factory=dict)
@@ -101,9 +106,7 @@ class Settings:
         if selected_profile not in {"live", "test", "demo"}:
             raise ValueError(f"unsupported profile: {selected_profile}")
 
-        home = Path(
-            os.environ.get("TERMOPS_HOME", os.environ.get("ERRA_HOME", Path.home() / ".termops"))
-        ).resolve()
+        home = Path(os.environ.get("TERMOPS_HOME", os.environ.get("ERRA_HOME", Path.home() / ".termops"))).resolve()
         settings = cls(
             profile=cast(Profile, selected_profile),
             state_dir=home,
@@ -159,18 +162,14 @@ class Settings:
                 settings,
                 web_host=str(server.get("web_host", settings.web_host)),
                 web_port=int(server.get("web_port", settings.web_port)),
+                web_secure_cookie=bool(server.get("web_secure_cookie", settings.web_secure_cookie)),
                 state_dir=Path(server.get("state_dir", str(settings.state_dir))).expanduser().resolve(),
                 run_dir=Path(server.get("run_dir", str(settings.run_dir))).expanduser().resolve(),
                 approval_ttl_seconds=int(policy.get("approval_ttl_seconds", settings.approval_ttl_seconds)),
                 env_allowlist=set(policy.get("env_allowlist", list(settings.env_allowlist))),
                 operator_name=str(raw.get("operator", {}).get("name", settings.operator_name)),
                 llm=llm_config,
-                hook_enabled=bool(hook_raw.get("enabled", settings.hook_enabled)),
                 hook_shell=str(hook_raw.get("shell", settings.hook_shell)),
-                hook_capture_stderr=bool(hook_raw.get("capture_stderr", settings.hook_capture_stderr)),
-                hook_capture_stdout=bool(hook_raw.get("capture_stdout", settings.hook_capture_stdout)),
-                hook_max_output=int(hook_raw.get("max_output", settings.hook_max_output)),
-                hook_min_exit_code=int(hook_raw.get("min_exit_code", settings.hook_min_exit_code)),
                 extra=raw,
             )
         else:

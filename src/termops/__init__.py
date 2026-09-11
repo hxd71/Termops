@@ -8,4 +8,6 @@ actions through a CLI-first interface.
 from .config import LLMProvider, Settings
 from .engine import OpsEngine
 
-__all__ = ["LLMProvider", "OpsEngine", "Settings"]
+__version__ = "0.8.0"
+
+__all__ = ["LLMProvider", "OpsEngine", "Settings", "__version__"]

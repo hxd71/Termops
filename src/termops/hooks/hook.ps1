@@ -4,33 +4,49 @@
 # Install:  termops hook install
 # Status:   termops hook status
 # Uninstall: termops hook uninstall
-#
-# Or manually add to your $PROFILE:
-#   . "$env:TERMOPS_HOME\hook.ps1"
 
-$Global:__termops_last_command = ""
-$Global:__termops_last_exit = 0
+$__termops_home = if ($env:TERMOPS_HOME) { $env:TERMOPS_HOME } else { Join-Path $HOME ".termops" }
+$__termops_hook_file = Join-Path $__termops_home "hook_status.txt"
+$Global:__termops_last_fingerprint = ""
 
-# Override the prompt function to capture last command output
-$original_prompt = Get-Content Function:\prompt -ErrorAction SilentlyContinue
+# PS 7.3+: surface native command failures as ErrorRecords so their stderr
+# text is capturable via $Error[0] instead of vanishing into the console.
+if ($PSVersionTable.PSVersion -ge [version]"7.3") {
+    $global:PSNativeCommandUseErrorActionPreference = $true
+}
 
-function prompt {
-    $Global:__termops_last_exit = $LASTEXITCODE
+# Preserve the existing prompt so we can delegate after doing our capture.
+$__termops_original_prompt = $function:prompt
 
-    if ($Global:__termops_last_exit -ge 1) {
-        # Only capture if hook is enabled and not already analyzing
-        $hookFile = "$env:TERMOPS_HOME\hook_status.txt"
-        if ((Test-Path $hookFile) -and (Get-Content $hookFile -Raw).Trim() -eq "enabled") {
-            $errorText = $Error[0].Exception.Message -replace "`n", " "
-            if ($errorText) {
-                termops analyze --text "$errorText" --source "ps-hook" 2>$null
-            }
+function global:prompt {
+    # Capture FIRST, before anything in here can clobber $? / $LASTEXITCODE.
+    $last_success = $?
+    $exit_code = $global:LASTEXITCODE
+    $last_error = $global:Error[0]
+
+    $failed = ($exit_code -is [int] -and $exit_code -ge 1) -or (-not $last_success)
+    if ($failed -and (Test-Path $__termops_hook_file) -and (Get-Content $__termops_hook_file -Raw).Trim() -eq "enabled") {
+        $last_cmd = ""
+        try { $last_cmd = (Get-History -Count 1).CommandLine } catch {}
+        $text = ""
+        if ($last_error) { $text = ($last_error | Out-String).Trim() }
+        if (-not $text) { $text = "Command '$last_cmd' exited with code $exit_code" }
+        if ($text.Length -gt 2000) { $text = $text.Substring(0, 2000) }
+
+        # Prompt redraws (resize etc.) must not resubmit the same failure.
+        $fingerprint = "$last_cmd|$exit_code|$text"
+        if ($fingerprint -ne $Global:__termops_last_fingerprint) {
+            $Global:__termops_last_fingerprint = $fingerprint
+            # Fire-and-forget: never block the prompt on the daemon round-trip.
+            $arg_text = $text -replace '"', '\"'
+            $arg_cmd = $last_cmd -replace '"', '\"'
+            Start-Process -FilePath "termops" -WindowStyle Hidden `
+                -ArgumentList "analyze --text `"$arg_text`" --source ps-hook --command `"$arg_cmd`" --exit-code $exit_code"
         }
     }
 
-    # Call original prompt function
-    if ($original_prompt) {
-        & $original_prompt
+    if ($__termops_original_prompt) {
+        & $__termops_original_prompt
     } else {
         "PS $($executionContext.SessionState.Path.CurrentLocation)$('>' * ($nestedPromptLevel + 1)) "
     }

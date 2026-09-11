@@ -15,6 +15,15 @@ def auth(engine: OpsEngine) -> dict[str, str]:
     return {"X-Operator-Token": engine.operator_token}
 
 
+def test_probe_accepts_empty_body(settings) -> None:
+    engine = OpsEngine(settings)
+    with TestClient(create_app(settings, engine)) as client:
+        response = client.post("/v1/tasks/probe", json={}, headers=auth(engine))
+        assert response.status_code == 202
+        assert response.json()["kind"] == "probe"
+    engine.store.close()
+
+
 def test_api_requires_operator_token(settings) -> None:
     engine = OpsEngine(settings)
     with TestClient(create_app(settings, engine)) as client:
@@ -141,6 +150,66 @@ def test_web_login_diagnosis_and_csrf(settings) -> None:
     engine.store.close()
 
 
+def test_corrections_api_roundtrip(settings) -> None:
+    engine = OpsEngine(settings)
+    app = create_app(settings, engine)
+    with TestClient(app) as client:
+        # Invalid severity is rejected by the schema.
+        bad = client.post(
+            "/v1/corrections",
+            headers=auth(engine),
+            json={"sample_text": "boom", "code": "X", "severity": "SEVERE", "meaning": "m"},
+        )
+        assert bad.status_code == 422
+
+        created = client.post(
+            "/v1/corrections",
+            headers=auth(engine),
+            json={
+                "sample_text": "ERROR: disk quota exceeded on /var/lib/app",
+                "code": "DISK_QUOTA_EXCEEDED",
+                "severity": "HIGH",
+                "meaning": "Per-user quota reached.",
+                "remediation": "Clean up or raise the quota.",
+            },
+        )
+        assert created.status_code == 201
+        fingerprint = created.json()["fingerprint"]
+
+        listed = client.get("/v1/corrections", headers=auth(engine)).json()
+        assert any(row["fingerprint"] == fingerprint for row in listed)
+
+        deleted = client.delete(f"/v1/corrections/{fingerprint}", headers=auth(engine)).json()
+        assert deleted["deleted"] is True
+    engine.store.close()
+
+
+def test_web_login_lockout_and_logout(settings) -> None:
+    engine = OpsEngine(settings)
+    app = create_app(settings, engine)
+    with TestClient(app) as client:
+        # Repeated bad codes from the same client eventually lock out (429).
+        for _ in range(5):
+            bad = client.get("/login?code=definitely-wrong")
+        assert bad.status_code in {401, 429}
+        assert client.get("/login?code=definitely-wrong").status_code == 429
+
+    # A fresh app instance resets the limiter (in-memory by design).
+    with TestClient(create_app(settings, engine)) as client:
+        # Valid login still works, then logout invalidates the session.
+        login = client.post("/v1/web/login-code", headers=auth(engine)).json()
+        code = login["url"].split("code=", 1)[1]
+        logged_in = client.get(f"/login?code={code}", follow_redirects=True)
+        assert logged_in.status_code == 200
+
+        client.get("/logout", follow_redirects=False)
+        # Session cookie is gone; the UI redirects back to /login.
+        after = client.get("/ui/", follow_redirects=False)
+        assert after.status_code == 303
+        assert after.headers["location"] == "/login"
+    engine.store.close()
+
+
 def test_cancel_invalidates_pending_action(settings) -> None:
     engine = OpsEngine(settings)
     with TestClient(create_app(settings, engine)) as client:
@@ -162,9 +231,7 @@ def test_cancel_invalidates_pending_action(settings) -> None:
             time.sleep(0.01)
         action = detail["actions"][0]
 
-        cancelled = client.post(
-            f"/v1/tasks/{created['id']}/cancel", headers=auth(engine)
-        )
+        cancelled = client.post(f"/v1/tasks/{created['id']}/cancel", headers=auth(engine))
         assert cancelled.status_code == 200
         assert cancelled.json()["status"] == "cancelled"
         assert engine.store.get_action(action["id"]).status.value == "rejected"
@@ -198,12 +265,7 @@ async def test_sse_stream_emits_auditable_task_updates(settings) -> None:
     )
     engine.store.update_task(task.id, TaskStatus.RUNNING)
 
-    chunks = [
-        chunk
-        async for chunk in stream_task_events(
-            ConnectedOnce(), engine.store, task.id, poll_seconds=0
-        )
-    ]
+    chunks = [chunk async for chunk in stream_task_events(ConnectedOnce(), engine.store, task.id, poll_seconds=0)]
 
     payload = "".join(chunks)
     assert "event: audit" in payload

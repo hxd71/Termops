@@ -12,6 +12,7 @@ from typing import Any, cast
 
 import click
 import httpx
+import tomli_w
 
 from .config import Settings
 from .llm import LLMProvider
@@ -75,6 +76,17 @@ def _style_status(status: str) -> str:
 
 def print_json(value: Any) -> None:
     click.echo(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _wait_task_detail(client: AgentClient, task_id: str, *, timeout: float = 180.0, interval: float = 0.5) -> dict[str, Any]:
+    """Poll until the task settles, so the rendered report shows real results."""
+    deadline = time.monotonic() + timeout
+    while True:
+        detail = client.request("GET", f"/v1/tasks/{task_id}")
+        status = detail["task"]["status"]
+        if status in TERMINAL_STATUSES or status == "waiting_approval" or time.monotonic() >= deadline:
+            return detail
+        time.sleep(interval)
 
 
 def _render_task(detail: dict[str, Any]) -> None:
@@ -197,8 +209,7 @@ def analyze(
     if use_json:
         print_json(result)
     else:
-        detail = client.request("GET", f"/v1/tasks/{result['id']}")
-        _render_task(detail)
+        _render_task(_wait_task_detail(client, result["id"]))
 
 
 @cli.command(context_settings={"ignore_unknown_options": True})
@@ -219,8 +230,7 @@ def run(ctx: click.Context, command_parts: tuple[str, ...], language: str, cwd: 
     if use_json:
         print_json(result)
     else:
-        detail = client.request("GET", f"/v1/tasks/{result['id']}")
-        _render_task(detail)
+        _render_task(_wait_task_detail(client, result["id"]))
 
 
 @cli.command()
@@ -236,9 +246,7 @@ def doctor(ctx: click.Context) -> None:
         llm = result.get("llm", {})
         provider = llm.get("provider", "none")
         llm_status = (
-            click.style("enabled", fg="green")
-            if llm.get("enabled")
-            else click.style("disabled", fg="bright_black")
+            click.style("enabled", fg="green") if llm.get("enabled") else click.style("disabled", fg="bright_black")
         )
         click.echo(click.style("LLM", bold=True) + f":     {llm_status} ({provider}/{llm.get('model') or 'none'})")
         host = result.get("host", {})
@@ -397,6 +405,86 @@ def web_login(ctx: click.Context) -> None:
     click.echo("This one-time local link expires in 120 seconds.")
 
 
+# ── Operator corrections ────────────────────────────────────────────────────
+
+
+@cli.group()
+def corrections() -> None:
+    """Teach the classifier: manage operator corrections for error fingerprints."""
+
+
+@corrections.command("add")
+@click.argument("sample_text")
+@click.option("--code", required=True, help="Classification code, e.g. POSTGRES_UNDEFINED_TABLE.")
+@click.option(
+    "--severity",
+    type=click.Choice(["LOW", "MEDIUM", "HIGH", "CRITICAL"], case_sensitive=False),
+    default="MEDIUM",
+    show_default=True,
+)
+@click.option("--meaning", required=True, help="What this error means in your environment.")
+@click.option("--remediation", default=None, help="How to fix it.")
+@click.pass_context
+def corrections_add(
+    ctx: click.Context, sample_text: str, code: str, severity: str, meaning: str, remediation: str | None
+) -> None:
+    """Record a correction for the *kind* of error SAMPLE_TEXT represents.
+
+    Paths, versions, IPs and line numbers are stripped into a normalized
+    fingerprint, so one correction covers every recurrence of the same error.
+    """
+    client, use_json = _client_ctx(ctx)
+    result = client.request(
+        "POST",
+        "/v1/corrections",
+        {
+            "sample_text": sample_text,
+            "code": code,
+            "severity": severity.upper(),
+            "meaning": meaning,
+            "remediation": remediation,
+        },
+    )
+    if use_json:
+        print_json(result)
+    else:
+        click.echo(f"Correction recorded for fingerprint {result['fingerprint']}")
+        click.echo(f"  {_style_severity(result['severity'])} {result['code']}: {result['meaning']}")
+
+
+@corrections.command("list")
+@click.pass_context
+def corrections_list(ctx: click.Context) -> None:
+    """List recorded corrections, most-hit first."""
+    client, use_json = _client_ctx(ctx)
+    result = client.request("GET", "/v1/corrections")
+    rows = sorted(result, key=lambda r: r.get("hits", 0), reverse=True)
+    if use_json:
+        print_json(rows)
+        return
+    if not rows:
+        click.echo("No corrections recorded yet. Use `termops corrections add` to teach the classifier.")
+        return
+    for row in rows:
+        click.echo(f"{_style_severity(row['severity'])} {row['code']}  (hits: {row['hits']})")
+        click.echo(f"  fingerprint: {row['fingerprint']}")
+        click.echo(f"  sample:      {row['sample'][:100]}")
+        click.echo(f"  meaning:     {row['meaning']}")
+
+
+@corrections.command("delete")
+@click.argument("fingerprint")
+@click.pass_context
+def corrections_delete(ctx: click.Context, fingerprint: str) -> None:
+    """Remove a correction by its fingerprint."""
+    client, use_json = _client_ctx(ctx)
+    result = client.request("DELETE", f"/v1/corrections/{fingerprint}")
+    if use_json:
+        print_json(result)
+    else:
+        click.echo(f"Correction {fingerprint}: deleted")
+
+
 # ── Terminal hook ───────────────────────────────────────────────────────────
 
 
@@ -425,13 +513,9 @@ def hook_install(ctx: click.Context) -> None:
         )
         source_line = f'. "{script.as_posix()}"'
     else:
-        shell = os.environ.get("SHELL", "/bin/bash")
-        if "zsh" in shell:
-            script = hooks_dir / "hook.sh"
-            profile_path = Path.home() / ".zshrc"
-        else:
-            script = hooks_dir / "hook.sh"
-            profile_path = Path.home() / ".bashrc"
+        shell = settings.hook_shell if settings.hook_shell in {"bash", "zsh"} else os.environ.get("SHELL", "/bin/bash")
+        script = hooks_dir / "hook.sh"
+        profile_path = Path.home() / (".zshrc" if "zsh" in shell else ".bashrc")
         source_line = f'source "{script.as_posix()}"'
 
     # Write hook status
@@ -505,8 +589,10 @@ def config_show(ctx: click.Context) -> None:
     click.echo()
 
     click.echo(click.style("Terminal Hook", bold=True))
-    click.echo(f"  Enabled:      {'yes' if settings.hook_enabled else 'no'}")
     click.echo(f"  Shell:        {settings.hook_shell}")
+    hook_file = settings.state_dir / "hook_status.txt"
+    hook_state = hook_file.read_text().strip() if hook_file.exists() else "not installed"
+    click.echo(f"  Status:       {hook_state}")
 
 
 @config.command("llm")
@@ -576,21 +662,10 @@ def config_llm(
         raw["llm"] = llm_section
         config_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Write as TOML
-        lines = []
-        lines.append("# Termops configuration")
-        lines.append("")
-        lines.append("[llm]")
-        for key, value in llm_section.items():
-            if isinstance(value, bool):
-                lines.append(f"{key} = {str(value).lower()}")
-            elif isinstance(value, (int, float)):
-                lines.append(f"{key} = {value}")
-            else:
-                lines.append(f'{key} = "{value}"')
-        lines.append("")
-
-        config_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        # Serialize the whole document (not just [llm]) so unrelated sections
+        # such as [server], [operator], [policy], and [hook] survive a
+        # `termops config llm` round-trip instead of being silently dropped.
+        config_path.write_text(tomli_w.dumps(raw), encoding="utf-8")
         # The file may contain an API key: restrict to owner-only on POSIX.
         # On Windows chmod only toggles the read-only bit, which is a no-op here.
         with contextlib.suppress(OSError):
@@ -694,9 +769,7 @@ def eval_run(ctx: click.Context, dataset: str, runs: int, output: str | None) ->
         engine = EvalEngine(llm_client=llm)
 
         try:
-            all_results = asyncio.get_event_loop().run_until_complete(
-                engine.evaluate_llm(samples, runs=runs)
-            )
+            all_results = asyncio.get_event_loop().run_until_complete(engine.evaluate_llm(samples, runs=runs))
         except RuntimeError:
             all_results = asyncio.run(engine.evaluate_llm(samples, runs=runs))
 
@@ -724,7 +797,6 @@ def eval_list() -> None:
 
     for name in list_datasets():
         click.echo(f"  {name}")
-
 
 
 def main() -> None:
