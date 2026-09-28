@@ -774,7 +774,10 @@ def suggest_followup_command(text: str, codes: set[str], language: str, command:
         return "git status"
     if "DISK_FULL" in codes:
         if os.name == "nt":
-            return 'powershell -NoProfile -Command "Get-CimInstance Win32_LogicalDisk | Select-Object DeviceID,Size,FreeSpace"'
+            return (
+                'powershell -NoProfile -Command "Get-CimInstance Win32_LogicalDisk '
+                '| Select-Object DeviceID,Size,FreeSpace"'
+            )
         return "df -h"
     if "PORT_IN_USE" in codes:
         return "netstat -ano" if os.name == "nt" else "ss -tlnp"

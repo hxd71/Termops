@@ -78,7 +78,13 @@ def print_json(value: Any) -> None:
     click.echo(json.dumps(value, ensure_ascii=False, indent=2))
 
 
-def _wait_task_detail(client: AgentClient, task_id: str, *, timeout: float = 180.0, interval: float = 0.5) -> dict[str, Any]:
+def _wait_task_detail(
+    client: AgentClient,
+    task_id: str,
+    *,
+    timeout: float = 180.0,
+    interval: float = 0.5,
+) -> dict[str, Any]:
     """Poll until the task settles, so the rendered report shows real results."""
     deadline = time.monotonic() + timeout
     while True:

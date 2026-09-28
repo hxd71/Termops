@@ -31,6 +31,6 @@ ENV PYTHONUNBUFFERED=1
 EXPOSE 8923
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8923/health || exit 1
+    CMD curl -f http://localhost:8923/healthz || exit 1
 
 ENTRYPOINT ["termops-agent", "--profile", "demo"]

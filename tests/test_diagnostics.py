@@ -167,7 +167,8 @@ def test_noisy_substrings_do_not_false_positive() -> None:
     # '429' inside a port number must not match RATE_LIMITED
     assert "RATE_LIMITED" not in {m["code"] for m in generic_error_evidence("listening on port 42900 ok")}
     # a yaml filename alone is not a yaml parse error
-    assert "CONFIG_PARSE_ERROR" not in {m["code"] for m in generic_error_evidence("reading config.yaml failed: permission denied")}
+    evidence = generic_error_evidence("reading config.yaml failed: permission denied")
+    assert "CONFIG_PARSE_ERROR" not in {m["code"] for m in evidence}
     # 'expected'/'actual' as plain words must not match TEST_FAILURE
     assert "TEST_FAILURE" not in {m["code"] for m in generic_error_evidence("the expected actual behavior differs")}
 
